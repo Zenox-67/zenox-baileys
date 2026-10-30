@@ -1,0 +1,23 @@
+name: fix
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Perbaiki tipe di messages-media.ts
+        run: |
+          set -e
+          F=src/Utils/messages-media.ts
+          if grep -q 'rawData\[blockStart + j\] ?? 0' "$F"; then echo "sudah diperbaiki"; exit 0; fi
+          grep -q 'Math.abs(rawData\[blockStart + j\])' "$F" || { echo "baris tidak ditemukan"; exit 1; }
+          sed -i 's/Math.abs(rawData\[blockStart + j\])/Math.abs(rawData[blockStart + j] ?? 0)/' "$F"
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
+          git add "$F"
+          git commit -m "fix: tipe rawData di messages-media"
+          git push
