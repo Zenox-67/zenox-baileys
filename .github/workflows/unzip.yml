@@ -1,0 +1,28 @@
+name: unzip
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ekstrak zip ke root repo
+        run: |
+          set -e
+          Z=$(find . -maxdepth 1 -name '*.zip' | head -n1)
+          if [ -z "$Z" ]; then echo "tidak ada zip, selesai"; exit 0; fi
+          rm -rf /tmp/x && mkdir /tmp/x
+          unzip -q "$Z" -d /tmp/x
+          P=$(find /tmp/x -maxdepth 2 -name package.json -not -path '*/node_modules/*' | head -n1)
+          D=$(dirname "$P")
+          test -f "$D/src/Zenox/rich/rich.ts" || { echo "ZIP SALAH: bukan zenox-baileys-full.zip"; exit 1; }
+          rm -f "$Z"
+          rsync -a --exclude='.github' "$D"/ ./
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -m "extract zenox baileys"
+          git push
