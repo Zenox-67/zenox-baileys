@@ -26,8 +26,10 @@ import type {
 } from '../Types'
 import { type BinaryNode, getBinaryNodeChild, getBinaryNodeChildBuffer, jidNormalizedUser } from '../WABinary'
 import { aesDecryptGCM, aesEncryptGCM, hkdf } from './crypto'
+import { getSharedHttp, isFastHttpEnabled } from './fast-http'
 import { generateMessageIDV2 } from './generics'
 import type { ILogger } from './logger'
+import { FAST_MEDIA_MAX_BYTES } from './media-fast'
 
 const getTmpFilesDirectory = () => tmpdir()
 
@@ -156,10 +158,12 @@ export const extractImageThumb = async (bufferOrFilePath: Readable | Buffer | st
 
 	const lib = await getImageProcessingLibrary()
 	if ('sharp' in lib && typeof lib.sharp?.default === 'function') {
-		const img = lib.sharp.default(bufferOrFilePath)
-		const dimensions = await img.metadata()
-
-		const buffer = await img.resize(width).jpeg({ quality: 50 }).toBuffer()
+		// header read and resize run side by side; failOn 'none' still makes a thumbnail from slightly damaged images
+		const img = lib.sharp.default(bufferOrFilePath, { failOn: 'none' })
+		const [dimensions, buffer] = await Promise.all([
+			img.metadata(),
+			img.clone().resize(width).jpeg({ quality: 50 }).toBuffer()
+		])
 		return {
 			buffer,
 			original: {
@@ -339,9 +343,67 @@ export const getStream = async (item: WAMediaUpload, opts?: RequestInit & { maxC
 	return { stream: createReadStream(item.url), type: 'file' } as const
 }
 
+/**
+ * Reads the media fully into memory when it is small enough (<= maxBytes), otherwise returns undefined so the caller
+ * falls back to the streaming path. Streams (`{ stream }`) are never read here.
+ */
+export const loadMediaBuffer = async (
+	media: WAMediaUpload,
+	maxBytes: number = FAST_MEDIA_MAX_BYTES,
+	opts?: RequestInit & { maxContentLength?: number }
+): Promise<Buffer | undefined> => {
+	const cap = opts?.maxContentLength ? Math.min(maxBytes, opts.maxContentLength) : maxBytes
+	if (Buffer.isBuffer(media)) {
+		return media.length <= cap ? media : undefined
+	}
+
+	if ('stream' in media) {
+		return undefined
+	}
+
+	const urlStr = media.url.toString()
+	if (urlStr.startsWith('data:')) {
+		const buffer = Buffer.from(urlStr.split(',')[1]!, 'base64')
+		return buffer.length <= cap ? buffer : undefined
+	}
+
+	if (urlStr.startsWith('http://') || urlStr.startsWith('https://')) {
+		if (!isFastHttpEnabled()) {
+			return undefined
+		}
+
+		const res = await getSharedHttp().get(urlStr, {
+			headers: opts?.headers as any,
+			signal: opts?.signal ?? null,
+			compress: false,
+			maxBytes: cap
+		})
+		if (!res.ok) {
+			res.stream.destroy()
+			throw new Boom(`Failed to fetch stream from ${urlStr}`, { statusCode: res.status, data: { url: urlStr } })
+		}
+
+		const declared = Number(res.header('content-length'))
+		if (Number.isFinite(declared) && declared > cap) {
+			res.stream.destroy()
+			return undefined
+		}
+
+		try {
+			return await res.buffer()
+		} catch (err: any) {
+			if (err?.code === 'ETOOBIG') return undefined
+			throw err
+		}
+	}
+
+	const stat = await fs.stat(urlStr)
+	return stat.size <= cap ? fs.readFile(urlStr) : undefined
+}
+
 /** generates a thumbnail for a given media, if required */
 export async function generateThumbnail(
-	file: string,
+	file: string | Buffer,
 	mediaType: 'video' | 'image',
 	options: {
 		logger?: ILogger
@@ -358,7 +420,7 @@ export async function generateThumbnail(
 				height: original.height
 			}
 		}
-	} else if (mediaType === 'video') {
+	} else if (mediaType === 'video' && typeof file === 'string') {
 		const imgFilename = join(getTmpFilesDirectory(), generateMessageIDV2() + '.jpg')
 		try {
 			await extractVideoThumb(file, imgFilename, '00:00:00', { width: 32, height: 32 })
@@ -377,7 +439,43 @@ export async function generateThumbnail(
 	}
 }
 
+/** Same as generateThumbnail, for media that is already in memory (videos need a short-lived temp file for ffmpeg). */
+export async function generateThumbnailFromBuffer(
+	buffer: Buffer,
+	mediaType: 'video' | 'image',
+	options: { logger?: ILogger }
+) {
+	if (mediaType === 'image') {
+		return generateThumbnail(buffer, 'image', options)
+	}
+
+	const tmpFile = join(getTmpFilesDirectory(), mediaType + generateMessageIDV2() + '-thumb')
+	try {
+		await fs.writeFile(tmpFile, buffer)
+		return await generateThumbnail(tmpFile, 'video', options)
+	} finally {
+		await fs.unlink(tmpFile).catch(() => {})
+	}
+}
+
 export const getHttpStream = async (url: string | URL, options: RequestInit & { isStream?: true } = {}) => {
+	// keep-alive connections + cached DNS (see fast-http.ts); an explicit undici `dispatcher` keeps using global fetch
+	if (!options.dispatcher && isFastHttpEnabled()) {
+		const timeout = (options as { timeout?: number; timeoutMs?: number }).timeout ?? (options as { timeoutMs?: number }).timeoutMs
+		const res = await getSharedHttp().get(url.toString(), {
+			headers: options.headers as any,
+			signal: options.signal ?? null,
+			compress: false,
+			...(timeout ? { timeoutMs: timeout } : {})
+		})
+		if (!res.ok) {
+			res.stream.destroy()
+			throw new Boom(`Failed to fetch stream from ${url}`, { statusCode: res.status, data: { url } })
+		}
+
+		return res.stream
+	}
+
 	const response = await fetch(url.toString(), {
 		dispatcher: options.dispatcher,
 		method: 'GET',
@@ -701,13 +799,15 @@ type MediaUploadResult = {
 export type UploadParams = {
 	url: string
 	filePath: string
+	/** when set, this is uploaded instead of reading `filePath` */
+	buffer?: Buffer
 	headers: Record<string, string>
 	timeoutMs?: number
 	agent?: Agent
 }
 
 export const uploadWithNodeHttp = async (
-	{ url, filePath, headers, timeoutMs, agent }: UploadParams,
+	{ url, filePath, buffer, headers, timeoutMs, agent }: UploadParams,
 	redirectCount = 0
 ): Promise<MediaUploadResult | undefined> => {
 	if (redirectCount > 5) {
@@ -718,8 +818,7 @@ export const uploadWithNodeHttp = async (
 	const httpModule = parsedUrl.protocol === 'https:' ? await import('https') : await import('http')
 
 	// Get file size for Content-Length header (required for Node.js streaming)
-	const fileStats = await fs.stat(filePath)
-	const fileSize = fileStats.size
+	const fileSize = buffer ? buffer.length : (await fs.stat(filePath)).size
 
 	return new Promise((resolve, reject) => {
 		const req = httpModule.request(
@@ -745,6 +844,7 @@ export const uploadWithNodeHttp = async (
 							{
 								url: newUrl,
 								filePath,
+								buffer,
 								headers,
 								timeoutMs,
 								agent
@@ -773,6 +873,11 @@ export const uploadWithNodeHttp = async (
 			reject(new Error('Upload timeout'))
 		})
 
+		if (buffer) {
+			req.end(buffer)
+			return
+		}
+
 		const stream = createReadStream(filePath)
 		stream.pipe(req)
 		stream.on('error', err => {
@@ -785,20 +890,20 @@ export const uploadWithNodeHttp = async (
 const uploadWithFetch = async ({
 	url,
 	filePath,
+	buffer,
 	headers,
 	timeoutMs,
 	agent
 }: UploadParams): Promise<MediaUploadResult | undefined> => {
 	// Convert Node.js Readable to Web ReadableStream
-	const nodeStream = createReadStream(filePath)
-	const webStream = Readable.toWeb(nodeStream) as ReadableStream
+	const webStream = buffer ? undefined : (Readable.toWeb(createReadStream(filePath)) as ReadableStream)
 	// Native fetch only accepts Undici-style dispatchers, not generic https Agents.
 	const dispatcher = typeof (agent as { dispatch?: unknown } | undefined)?.dispatch === 'function' ? agent : undefined
 
 	const response = await fetch(url, {
 		...(dispatcher ? { dispatcher } : {}),
 		method: 'POST',
-		body: webStream,
+		body: (buffer ? new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength) : webStream) as any,
 		headers,
 		duplex: 'half',
 		signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined
@@ -842,7 +947,10 @@ export const getWAUploadToServer = (
 	{ customUploadHosts, fetchAgent, logger, options }: SocketConfig,
 	refreshMediaConn: (force: boolean) => Promise<MediaConnInfo>
 ): WAMediaUploadFunction => {
-	return async (filePath, { mediaType, fileEncSha256B64, timeoutMs }) => {
+	// keep-alive pool + cached DNS: consecutive uploads skip DNS/TCP/TLS (an agent given by the user wins)
+	const uploadAgent = (fetchAgent ?? (isFastHttpEnabled() ? getSharedHttp().agent('https:') : undefined)) as Agent | undefined
+
+	const upload: WAMediaUploadFunction = async (filePath, { mediaType, fileEncSha256B64, timeoutMs, buffer }) => {
 		// send a query JSON to obtain the url & auth token to upload our media
 		let uploadInfo = await refreshMediaConn(false)
 
@@ -876,9 +984,10 @@ export const getWAUploadToServer = (
 					{
 						url,
 						filePath,
+						...(buffer ? { buffer } : {}),
 						headers,
 						timeoutMs,
-						agent: fetchAgent
+						...(uploadAgent ? { agent: uploadAgent } : {})
 					},
 					logger
 				)
@@ -911,6 +1020,10 @@ export const getWAUploadToServer = (
 
 		return urls
 	}
+
+	// tells prepareWAMessageMedia it may skip the temp file and hand over the encrypted bytes directly
+	upload.acceptsBuffer = true
+	return upload
 }
 
 const getMediaRetryKey = (mediaKey: Buffer | Uint8Array) => {

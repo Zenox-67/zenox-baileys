@@ -464,6 +464,42 @@ describe('socket wiring', () => {
 		await mgr.shutdown('test')
 	})
 
+	it('a send to a group that is not cached yet asks WhatsApp once, then every send uses the cache', async () => {
+		const { mgr, socks } = makeManager({ createCaches: () => ({ groups: new TieredCache() }) })
+		await mgr.start('main')
+		const s = socks[0]!
+		// what Baileys does inside relayMessage: it only calls cachedGroupMetadata (it never stores the answer itself)
+		const [a, b] = await Promise.all([s.config.cachedGroupMetadata('new@g.us'), s.config.cachedGroupMetadata('new@g.us')])
+		await s.config.cachedGroupMetadata('new@g.us')
+		assert.equal(a.id, 'new@g.us')
+		assert.equal(a, b)
+		assert.equal(s.groupMetadataCalls, 1)
+		await mgr.shutdown('test')
+	})
+
+	it('cacheGroupMetadata:false leaves Baileys to fetch the group by itself', async () => {
+		const { mgr, socks } = makeManager({ cacheGroupMetadata: false, createCaches: () => ({ groups: new TieredCache() }) })
+		await mgr.start('main')
+		assert.equal(await socks[0]!.config.cachedGroupMetadata('x@g.us'), undefined)
+		assert.equal(socks[0]!.groupMetadataCalls, 0)
+		await mgr.shutdown('test')
+	})
+
+	it('runs warm-up on open and for incoming (notify) messages only', async () => {
+		const calls: string[] = []
+		const warmup = {
+			onOpen: async () => void calls.push('open'),
+			onMessages: (_s: any, msgs: any[]) => void calls.push('messages:' + msgs.length)
+		}
+		const { mgr, socks } = makeManager({ warmup: warmup as any })
+		await mgr.start('main')
+		socks[0]!.emit('connection.update', { connection: 'open' })
+		socks[0]!.emit('messages.upsert', { messages: [{ key: { id: '1', remoteJid: 'a@s.whatsapp.net' } }], type: 'notify' })
+		socks[0]!.emit('messages.upsert', { messages: [{ key: { id: '2', remoteJid: 'a@s.whatsapp.net' } }], type: 'append' })
+		assert.deepEqual(calls, ['open', 'messages:1'])
+		await mgr.shutdown('test')
+	})
+
 	it('getMessage serves recently sent messages (for retries) and still honours a user getMessage', async () => {
 		const { mgr, socks } = makeManager({ socketConfig: { getMessage: async (k: any) => (k.id === 'user' ? { conversation: 'from user' } : undefined) } })
 		await mgr.start('main')

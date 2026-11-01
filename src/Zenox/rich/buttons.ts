@@ -1,4 +1,5 @@
 import type { proto } from '../../../WAProto/index.js'
+import { STAR_GLYPH } from './icons'
 
 /**
  * Native-flow buttons (`Message.interactiveMessage.nativeFlowMessage`).
@@ -16,6 +17,11 @@ const btn = (name: string, params: Record<string, unknown>): NativeButton => ({ 
 export const button = {
 	/** a tap sends back `id` (read it with `extractButtonId`) */
 	quickReply: (text: string, id: string) => btn('quick_reply', { display_text: text, id }),
+	/**
+	 * Quick reply with a star glyph (U+2605, text, not an emoji) in front of the label.
+	 * WhatsApp draws the little icon of a button itself; this is the way to get a star in the button.
+	 */
+	star: (text: string, id: string) => btn('quick_reply', { display_text: `${STAR_GLYPH} ${text}`, id }),
 	url: (text: string, url: string) => btn('cta_url', { display_text: text, url, merchant_url: url }),
 	/** copies `code` to the clipboard */
 	copy: (text: string, code: string) => btn('cta_copy', { display_text: text, copy_code: code }),
@@ -42,6 +48,8 @@ export interface InteractiveInput {
 	body: string
 	footer?: string
 	title?: string
+	/** picture shown above the text (an already uploaded `imageMessage`, see `ZenoxRich.sendButtons({ image })`) */
+	image?: proto.Message.IImageMessage
 	buttons: NativeButton[]
 	/** wrap in `viewOnceMessage` with `messageContextInfo`, which most clients need to draw native-flow buttons (default true) */
 	wrap?: boolean
@@ -51,7 +59,11 @@ export function buildInteractive(input: InteractiveInput): proto.IMessage {
 	const interactiveMessage: proto.Message.IInteractiveMessage = {
 		body: { text: input.body },
 		...(input.footer ? { footer: { text: input.footer } } : {}),
-		...(input.title ? { header: { title: input.title, hasMediaAttachment: false } } : {}),
+		...(input.image
+			? { header: { ...(input.title ? { title: input.title } : {}), hasMediaAttachment: true, imageMessage: input.image } }
+			: input.title
+				? { header: { title: input.title, hasMediaAttachment: false } }
+				: {}),
 		nativeFlowMessage: { buttons: input.buttons, messageParamsJson: '' }
 	}
 

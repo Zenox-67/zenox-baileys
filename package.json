@@ -1,23 +1,36 @@
 {
-  "name": "@zenox/baileys",
+  "name": "@zenox-67/baileys",
   "type": "module",
-  "version": "1.0.0",
-  "description": "Baileys fork: multi-session, Redis + cache, fast auto-reconnect, auto-save on crash/shutdown",
+  "version": "1.1.0",
+  "description": "Zenox Baileys: WhatsApp Web API (TypeScript) with multi-session, Redis + cache, fast auto-reconnect, fast media, rich messages and buttons",
   "keywords": [
     "whatsapp",
-    "automation",
+    "whatsapp-bot",
+    "whatsapp-web",
     "baileys",
+    "zenox",
     "multi-session",
     "redis",
-    "zenox"
+    "automation",
+    "bot"
   ],
   "license": "MIT",
-  "author": "Zenox",
+  "author": "Zenox-67",
+  "homepage": "https://github.com/Zenox-67/zenox-baileys#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zenox-67/zenox-baileys.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Zenox-67/zenox-baileys/issues"
+  },
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
     "lib/**/*",
     "WAProto/**/*",
+    "docs/zenox/**/*",
+    "docs/ZENOX.md",
     "engine-requirements.js"
   ],
   "scripts": {
@@ -39,7 +52,8 @@
     "test": "node --experimental-vm-modules ./node_modules/.bin/jest --testMatch '**/*.test.ts'",
     "test:e2e": "NODE_TLS_REJECT_UNAUTHORIZED=0 node --experimental-vm-modules ./node_modules/.bin/jest --runInBand --forceExit --testMatch '**/*.test-e2e.ts'",
     "update:version": "tsx ./scripts/update-version.ts",
-    "test:zenox": "node --import tsx --test src/Zenox/__tests__/*.ztest.ts"
+    "test:zenox": "node --import tsx --test src/Zenox/__tests__/*.ztest.ts",
+    "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
     "@cacheable/node-cache": "^1.4.0",
@@ -140,5 +154,9 @@
   "packageManager": "yarn@4.9.2",
   "engines": {
     "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

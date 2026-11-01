@@ -3,20 +3,29 @@ import { proto } from '../../WAProto/index.js'
 import makeWASocket from '../Socket/index'
 import type { UserFacingSocketConfig } from '../Types'
 import { initAuthCreds } from '../Utils/auth-utils'
+import { getSharedHttp } from '../Utils/fast-http'
 import { fetchLatestBaileysVersion } from '../Utils/generics'
-import { generateWAMessageFromContent } from '../Utils/messages'
+import { generateWAMessageFromContent, prepareWAMessageMedia } from '../Utils/messages'
 import { createZenoxAuthState, type ZenoxAuthHandle } from './auth-state'
 import { MemoryCache, RedisCache, TieredCache } from './cache'
 import { ZenoxManager, type ProcessHookOptions, type ReconnectOptions, type SentStore, type ZenoxManagerOptions } from './manager'
 import type { NetworkOptions } from './network'
 import { adaptRedis, connectRedis } from './redis'
+import { createReactor, parseReactArgs, type ReactKey, type ReactOptions, type ReactResult } from './react'
 import { ZenoxRich, type RichOptions, type RichSocketLike } from './rich/rich'
 import { FileStorage, MirrorStorage, RedisStorage } from './storage'
 import { defaultLogger, type ZenoxLogger, type ZenoxStorage } from './types'
+import { createWarmup, type WarmupOptions } from './warmup'
 import type { WriteBehindOptions } from './write-behind'
 
-/** A Baileys socket plus `sock.rich`: markdown, code, tables, math, buttons and "Lihat selengkapnya". */
-export type ZenoxSocket = ReturnType<typeof makeWASocket> & { rich: ZenoxRich }
+/** `sock.react(message, '✅')` or `sock.react(jid, key, '✅')`; see react.ts */
+export type ZenoxReact = {
+	(message: { key: ReactKey }, emoji: string, opts?: ReactOptions): Promise<ReactResult>
+	(jid: string, key: ReactKey, emoji: string, opts?: ReactOptions): Promise<ReactResult>
+}
+
+/** A Baileys socket plus `sock.rich` (markdown, code, tables, math, buttons) and `sock.react` (fast reactions). */
+export type ZenoxSocket = ReturnType<typeof makeWASocket> & { rich: ZenoxRich; react: ZenoxReact }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const reviveKey = (type: string, value: any) =>
@@ -79,6 +88,11 @@ export interface ZenoxOptions extends WriteBehindOptions {
 	staggerMs?: number
 	/** rich messages (`sock.rich`): options, or `false` to switch the feature off. Default on, mode 'text'. */
 	rich?: RichOptions | false
+	/**
+	 * Warm-up after connecting (groups into the cache, connection to the media server) and prefetch when a message arrives.
+	 * Default on. `false` switches it off; pass options to tune it.
+	 */
+	warmup?: WarmupOptions | false
 }
 
 /**
@@ -132,6 +146,10 @@ export async function createZenox(options: ZenoxOptions = {}): Promise<ZenoxMana
 	}
 
 	const manager = new ZenoxManager<ZenoxSocket>({
+		warmup:
+			options.warmup === false
+				? undefined
+				: createWarmup(options.warmup, { preconnect: url => getSharedHttp().preconnect(url) }),
 		makeSocket: config => makeWASocket(config as UserFacingSocketConfig) as ZenoxSocket,
 		storage,
 		logger,
@@ -191,6 +209,11 @@ export async function createZenox(options: ZenoxOptions = {}): Promise<ZenoxMana
 			if (!rich) {
 				rich = new ZenoxRich({
 					buildMessage: generateWAMessageFromContent as never,
+					prepareImage: async (rsock, _jid, image) => {
+						const s = rsock as unknown as { waUploadToServer: never }
+						const prepared = await prepareWAMessageMedia({ image } as never, { upload: s.waUploadToServer, logger } as never)
+						return prepared.imageMessage!
+					},
 					store: new TieredCache(new MemoryCache({ max: 5000, ttlMs: richTtl }), l2(session, 'rich', richTtl), richTtl),
 					options: options.rich || undefined,
 					logger
@@ -202,6 +225,22 @@ export async function createZenox(options: ZenoxOptions = {}): Promise<ZenoxMana
 		})
 		manager.on('logged-out', ({ session }) => void richBySession.delete(session))
 	}
+
+	// sock.react: ordered, de-duplicated, optionally fire-and-forget reactions
+	manager.onSocket(sock => {
+		const reactor = createReactor({
+			send: (jid, key, emoji) => sock.sendMessage(jid, { react: { text: emoji, key: key as never } }),
+			log: logger
+		})
+		sock.react = ((a: unknown, b: unknown, c?: unknown, d?: unknown) => {
+			try {
+				const { jid, key, emoji, opts } = parseReactArgs(a, b, c, d)
+				return reactor.react(jid, key, emoji, opts)
+			} catch (err) {
+				return Promise.reject(err)
+			}
+		}) as ZenoxReact
+	})
 
 	if (createdClient) {
 		manager.once('shutdown', () => {

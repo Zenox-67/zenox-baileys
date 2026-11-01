@@ -346,10 +346,19 @@ export type MessageGenerationOptionsFromContent = MiscMessageGenerationOptions &
 	userJid: string
 }
 
-export type WAMediaUploadFunction = (
+export type WAMediaUploadFunction = ((
 	encFilePath: string,
-	opts: { fileEncSha256B64: string; mediaType: MediaType; timeoutMs?: number }
-) => Promise<{ mediaUrl: string; directPath: string; meta_hmac?: string; ts?: number; fbid?: number }>
+	opts: {
+		fileEncSha256B64: string
+		mediaType: MediaType
+		timeoutMs?: number
+		/** encrypted bytes; present only when `acceptsBuffer` is true. `encFilePath` is then empty and must not be read */
+		buffer?: Buffer
+	}
+) => Promise<{ mediaUrl: string; directPath: string; meta_hmac?: string; ts?: number; fbid?: number }>) & {
+	/** set by the built-in uploader: it can upload `opts.buffer` without a temp file */
+	acceptsBuffer?: boolean
+}
 
 export type MediaGenerationOptions = {
 	logger?: ILogger

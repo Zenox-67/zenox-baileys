@@ -5,6 +5,7 @@ import type { ZenoxAuthHandle } from './auth-state'
 import type { TieredCache } from './cache'
 import { NetworkMonitor, type NetworkOptions } from './network'
 import { assertSessionId, defaultLogger, type ZenoxLogger, type ZenoxStorage } from './types'
+import type { Warmup } from './warmup'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -116,6 +117,8 @@ export interface ZenoxManagerOptions<S extends ZenoxSocketLike> {
 	 */
 	network?: NetworkOptions | false
 	activityMaxEvents?: number
+	/** background preloading (groups, media server connection, per-chat prefetch); see warmup.ts. Default: none. */
+	warmup?: Warmup
 }
 
 export interface ZenoxEventMap {
@@ -446,7 +449,17 @@ export class ZenoxManager<S extends ZenoxSocketLike = ZenoxSocketLike> extends E
 					if (m) return m
 				}
 
-				return caches.groups.get(`group:${jid}`)
+				const hit = await caches.groups.get(`group:${jid}`)
+				if (hit || this.options.cacheGroupMetadata === false) return hit
+				// Not cached yet. Baileys would ask WhatsApp on EVERY send to this group (it never stores that answer).
+				// Going through the wrapped sock.groupMetadata asks once, caches the answer and shares it with parallel sends.
+				const current = rt.sock as any
+				if (typeof current?.groupMetadata !== 'function') return undefined
+				try {
+					return await current.groupMetadata(jid)
+				} catch {
+					return undefined // Baileys then asks by itself and reports the real error
+				}
 			}
 		}
 
@@ -507,6 +520,7 @@ export class ZenoxManager<S extends ZenoxSocketLike = ZenoxSocketLike> extends E
 				activity.patch({ status: 'open', lastOpenAt: Date.now(), reconnects: activity.current.reconnects + (reconnected ? 1 : 0) })
 				activity.record('open', { reconnected })
 				this.emit('open', { session: rt.id, reconnected })
+				this.runWarmup(rt, sock, stale, 'open')
 			} else if (connection === 'close') {
 				this.onClose(rt, sock, lastDisconnect)
 			}
@@ -516,6 +530,7 @@ export class ZenoxManager<S extends ZenoxSocketLike = ZenoxSocketLike> extends E
 			if (stale()) return
 			const messages: any[] = u?.messages ?? []
 			if (!messages.length) return
+			if (u?.type === 'notify') this.runWarmup(rt, sock, stale, 'messages', messages)
 			const last = messages[messages.length - 1]
 			activity.current.messagesSeen += messages.length
 			activity.patch({ lastMessageAt: Date.now(), lastMessageJid: last?.key?.remoteJid })
@@ -553,6 +568,21 @@ export class ZenoxManager<S extends ZenoxSocketLike = ZenoxSocketLike> extends E
 				const original = (sock as any).groupMetadata.bind(sock)
 				;(sock as any).groupMetadata = (jid: string) => groups.wrap(`group:${jid}`, () => original(jid))
 			}
+		}
+	}
+
+	private runWarmup(rt: Runtime<S>, sock: S, stale: () => boolean, kind: 'open' | 'messages', messages?: any[]) {
+		const warmup = this.options.warmup
+		if (!warmup) return
+		const ctx = { session: rt.id, groups: rt.caches?.groups as any, log: this.log, stale }
+		try {
+			if (kind === 'open') {
+				warmup.onOpen(sock as any, ctx).catch(err => this.log.debug({ session: rt.id, err }, 'zenox: warm-up failed'))
+			} else {
+				warmup.onMessages(sock as any, messages ?? [], ctx)
+			}
+		} catch (err) {
+			this.log.debug({ session: rt.id, err }, 'zenox: warm-up failed')
 		}
 	}
 

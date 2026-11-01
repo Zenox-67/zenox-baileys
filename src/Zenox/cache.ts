@@ -169,6 +169,12 @@ export class TieredCache implements CacheStore {
 		return true
 	}
 
+	/** memory only: no redis write. For bulk preloading. */
+	setLocal<T>(key: string, value: T, ttlMs = this.ttlMs): boolean {
+		this.l1.set(key, value, ttlMs)
+		return true
+	}
+
 	del(key: string): boolean {
 		const had = this.l1.del(key)
 		if (this.l2) void this.l2.del(key)

@@ -23,3 +23,7 @@ await sock.rich.sendButtons(jid, { body, buttons: [...] })  // native-flow butto
 `await sock.rich.action('Ya', 'konfirmasi', data)` makes a button whose tap runs
 `sock.rich.onAction('konfirmasi', ({ data, jid }) => ...)`. `data` is stored in the cache / redis, so the
 button keeps working after a restart.
+
+## Tombol bintang
+
+`button.star('Favorit', id)` memberi karakter teks ★ (bukan emoji) di label. Gambar bintang dari SVG: `starPng()` lalu `sendButtons(jid, { image, ... })`. WhatsApp tidak mengizinkan ikon kustom di dalam tombol; lihat [docs/zenox/buttons.md](../../../docs/zenox/buttons.md).

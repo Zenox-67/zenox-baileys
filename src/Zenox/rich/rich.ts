@@ -52,6 +52,8 @@ export interface RichDeps {
 	/** Baileys' `generateWAMessageFromContent` */
 	buildMessage: (jid: string, content: proto.IMessage, options: { userJid: string; quoted?: any }) => any
 	store: RichStore
+	/** uploads a picture for the header of a button message and returns its `imageMessage` (needed for `sendButtons({ image })`) */
+	prepareImage?: (sock: RichSocketLike, jid: string, image: Buffer | { url: string }) => Promise<proto.Message.IImageMessage>
 	options?: RichOptions
 	logger?: ZenoxLogger
 }
@@ -161,10 +163,25 @@ export class ZenoxRich {
 	/** Send a message with native-flow buttons. */
 	async sendButtons(
 		jid: string,
-		input: { body: string; footer?: string; title?: string; buttons: NativeButton[]; wrap?: boolean },
+		input: {
+			body: string
+			footer?: string
+			title?: string
+			buttons: NativeButton[]
+			wrap?: boolean
+			/** a picture above the text, e.g. `await starPng()`; needs WhatsApp to accept an image header on native-flow messages (unverified on every client) */
+			image?: Buffer | { url: string }
+		},
 		opts: { quoted?: any } = {}
 	) {
-		const content = buildInteractive(input)
+		const { image, ...rest } = input
+		let imageMessage: proto.Message.IImageMessage | undefined
+		if (image) {
+			if (!this.deps.prepareImage) throw new Error('zenox rich: this setup cannot upload a header image (no prepareImage)')
+			imageMessage = await this.deps.prepareImage(this.s, jid, image)
+		}
+
+		const content = buildInteractive({ ...rest, ...(imageMessage ? { image: imageMessage } : {}) })
 		const isPrivate = !jid.endsWith('@g.us') && !jid.endsWith('@newsletter')
 		return this.relay(jid, content, opts.quoted, this.opt.nativeFlowNodes === false ? undefined : nativeFlowNodes(isPrivate))
 	}

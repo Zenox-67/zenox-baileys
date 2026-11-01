@@ -32,12 +32,25 @@ import { sha256 } from './crypto'
 import { generateMessageIDV2, getKeyAuthor, unixTimestampSeconds } from './generics'
 import type { ILogger } from './logger'
 import {
+	type CachedUpload,
+	contentCacheKey,
+	encryptMediaBuffer,
+	FAST_MEDIA_MAX_BYTES,
+	parseCachedUpload,
+	serializeCachedUpload,
+	sha256 as sha256Of,
+	shareInflight
+} from './media-fast'
+import {
 	downloadContentFromMessage,
 	encryptedStream,
 	generateThumbnail,
+	generateThumbnailFromBuffer,
 	getAudioDuration,
 	getAudioWaveform,
+	getMediaKeys,
 	getRawMediaUploadData,
+	loadMediaBuffer,
 	type MediaDownloadOptions
 } from './messages-media'
 import { shouldIncludeReportingToken } from './reporting-utils'
@@ -227,6 +240,162 @@ export const prepareWAMessageMedia = async (
 		mediaType === 'audio' && uploadData.ptt === true && typeof uploadData.waveform === 'undefined'
 	const requiresAudioBackground = options.backgroundColor && mediaType === 'audio' && uploadData.ptt === true
 	const requiresOriginalForSomeProcessing = requiresDurationComputation || requiresThumbnailComputation
+
+	const finalize = async (fields: {
+		url: string
+		directPath: string
+		mediaKey: Uint8Array
+		fileEncSha256: Uint8Array
+		fileSha256: Uint8Array
+		fileLength: number
+		mediaKeyTimestamp: number
+	}) => {
+		const obj = WAProto.Message.fromObject({
+			[`${mediaType}Message`]: MessageTypeProto[mediaType as keyof typeof MessageTypeProto].fromObject({
+				...fields,
+				...uploadData,
+				media: undefined
+			} as any)
+		})
+
+		if (uploadData.ptv) {
+			obj.ptvMessage = obj.videoMessage
+			delete obj.videoMessage
+		}
+
+		if (cacheableKey) {
+			logger?.debug({ cacheableKey }, 'set cache')
+			await options.mediaCache!.set(cacheableKey, WAProto.Message.encode(obj).finish())
+		}
+
+		return obj
+	}
+
+	// Fast path: media that fits in memory is encrypted in one go and uploaded straight from memory (no temp files),
+	// and an upload of the same content is reused. Anything else (streams, big files, custom uploaders) uses the path below.
+	const encType = options.mediaTypeOverride || mediaType
+	const plain = options.upload.acceptsBuffer
+		? await loadMediaBuffer(uploadData.media, FAST_MEDIA_MAX_BYTES, options.options as any)
+		: undefined
+	if (plain) {
+		const fileSha256 = sha256Of(plain)
+		const contentKey = contentCacheKey(mediaType, encType, fileSha256)
+		const cached = options.mediaCache ? parseCachedUpload(await options.mediaCache.get<string>(contentKey)) : undefined
+		if (cached) {
+			logger?.debug({ contentKey }, 'got media content cache hit')
+		}
+
+		const extra: CachedUpload['extra'] = { ...cached?.extra }
+		const fillExtras = async () => {
+			try {
+				if (requiresThumbnailComputation) {
+					if (extra.jpegThumbnail === undefined) {
+						const { thumbnail, originalImageDimensions } = await generateThumbnailFromBuffer(
+							plain,
+							mediaType as 'image' | 'video',
+							options
+						)
+						if (thumbnail !== undefined) extra.jpegThumbnail = thumbnail
+						if (originalImageDimensions) {
+							extra.width = originalImageDimensions.width
+							extra.height = originalImageDimensions.height
+						}
+
+						logger?.debug('generated thumbnail')
+					}
+
+					uploadData.jpegThumbnail = extra.jpegThumbnail
+					if (!uploadData.width && extra.width && extra.height) {
+						uploadData.width = extra.width
+						uploadData.height = extra.height
+					}
+				}
+
+				if (requiresDurationComputation) {
+					extra.seconds ??= await getAudioDuration(plain)
+					uploadData.seconds = extra.seconds
+				}
+
+				if (requiresWaveformProcessing) {
+					if (extra.waveform === undefined) {
+						const waveform = await getAudioWaveform(plain, logger)
+						if (waveform) extra.waveform = Buffer.from(waveform).toString('base64')
+					}
+
+					if (extra.waveform !== undefined) uploadData.waveform = Buffer.from(extra.waveform, 'base64')
+				}
+
+				if (requiresAudioBackground) {
+					uploadData.backgroundArgb = await assertColor(options.backgroundColor)
+				}
+			} catch (error) {
+				logger?.warn({ trace: (error as any).stack }, 'failed to obtain extra info')
+			}
+		}
+
+		const uploadFresh = async () => {
+			const mediaKey = randomBytes(32)
+			const keys = await getMediaKeys(mediaKey, encType)
+			const enc = encryptMediaBuffer(plain, keys, fileSha256)
+			const { mediaUrl, directPath } = await options.upload('', {
+				fileEncSha256B64: enc.fileEncSha256.toString('base64'),
+				mediaType,
+				timeoutMs: options.mediaUploadTimeoutMs,
+				buffer: enc.encBuffer
+			})
+			logger?.debug({ mediaType, cacheableKey }, 'uploaded media from memory')
+			return {
+				mediaKey,
+				fileEncSha256: enc.fileEncSha256,
+				mediaUrl,
+				directPath,
+				mediaKeyTimestamp: unixTimestampSeconds()
+			}
+		}
+
+		const [uploaded] = await Promise.all([
+			cached
+				? Promise.resolve({
+						mediaKey: Buffer.from(cached.mediaKey, 'base64'),
+						fileEncSha256: Buffer.from(cached.fileEncSha256, 'base64'),
+						mediaUrl: cached.mediaUrl,
+						directPath: cached.directPath,
+						mediaKeyTimestamp: cached.mediaKeyTimestamp
+					})
+				: // the same content sent twice at once is uploaded once
+					shareInflight(options.mediaCache ?? options.upload, contentKey, uploadFresh),
+			fillExtras()
+		])
+
+		if (!cached && options.mediaCache) {
+			await options.mediaCache.set(
+				contentKey,
+				serializeCachedUpload({
+					v: 1,
+					ts: Date.now(),
+					mediaKey: uploaded.mediaKey.toString('base64'),
+					fileEncSha256: uploaded.fileEncSha256.toString('base64'),
+					fileSha256: fileSha256.toString('base64'),
+					fileLength: plain.length,
+					mediaUrl: uploaded.mediaUrl,
+					directPath: uploaded.directPath,
+					mediaKeyTimestamp: uploaded.mediaKeyTimestamp,
+					extra
+				})
+			)
+		}
+
+		return finalize({
+			url: uploaded.mediaUrl,
+			directPath: uploaded.directPath,
+			mediaKey: uploaded.mediaKey,
+			fileEncSha256: uploaded.fileEncSha256,
+			fileSha256,
+			fileLength: plain.length,
+			mediaKeyTimestamp: uploaded.mediaKeyTimestamp
+		})
+	}
+
 	const { mediaKey, encFilePath, originalFilePath, fileEncSha256, fileSha256, fileLength } = await encryptedStream(
 		uploadData.media,
 		options.mediaTypeOverride || mediaType,
@@ -297,31 +466,15 @@ export const prepareWAMessageMedia = async (
 		}
 	})
 
-	const obj = WAProto.Message.fromObject({
-		[`${mediaType}Message`]: MessageTypeProto[mediaType as keyof typeof MessageTypeProto].fromObject({
-			url: mediaUrl,
-			directPath,
-			mediaKey,
-			fileEncSha256,
-			fileSha256,
-			fileLength,
-			mediaKeyTimestamp: unixTimestampSeconds(),
-			...uploadData,
-			media: undefined
-		} as any)
+	return finalize({
+		url: mediaUrl,
+		directPath,
+		mediaKey,
+		fileEncSha256,
+		fileSha256,
+		fileLength,
+		mediaKeyTimestamp: unixTimestampSeconds()
 	})
-
-	if (uploadData.ptv) {
-		obj.ptvMessage = obj.videoMessage
-		delete obj.videoMessage
-	}
-
-	if (cacheableKey) {
-		logger?.debug({ cacheableKey }, 'set cache')
-		await options.mediaCache!.set(cacheableKey, WAProto.Message.encode(obj).finish())
-	}
-
-	return obj
 }
 
 export const prepareDisappearingMessageSettingContent = (ephemeralExpiration?: number) => {
